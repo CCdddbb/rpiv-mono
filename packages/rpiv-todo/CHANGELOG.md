@@ -7,6 +7,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Retry a failed todo overlay refresh at turn end and after agent settlement, so a transient failure on the final completion update does not leave the panel showing stale progress until another todo call. Retries read committed live state, stay scoped to the foreground session, and are discarded on session shutdown.
+
 ## [2.15.0] - 2026-10-24
 
 ### Fixed

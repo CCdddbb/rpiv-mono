@@ -19,7 +19,7 @@
  * correctly after upgrade.
  */
 
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { COLLAPSE_KEY_OFF, resolveCollapseKey } from "./config.ts";
 import { I18N_NAMESPACE } from "./state/i18n-bridge.ts";
@@ -130,6 +130,7 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 	const loadTodoOverlay = makeTodoOverlayLoader(importOverlay);
 	let uiCtx: ExtensionUIContext | undefined;
 	let lifecycleGeneration = 0;
+	let overlayRefreshPending = false;
 
 	async function updateTodoOverlay(
 		resetCompletedDisplayState = false,
@@ -244,6 +245,7 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 			// Invalidate pending imports before clearing the foreground binding so a
 			// replaced session cannot inherit the stale overlay or UI context.
 			lifecycleGeneration++;
+			overlayRefreshPending = false;
 			uiCtx = undefined;
 			// `dispose()`'s first act is setWidget(KEY, undefined) on a possibly-stale
 			// ui proxy, which can throw. evictSession(s) above already deleted this
@@ -261,20 +263,44 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 
 	// Reads getTodos() at render time; do NOT call replayFromBranch here
 	// (branch is stale — message_end runs after tool_execution_end).
-	pi.on("tool_execution_end", async (event) => {
-		if (event.toolName !== TOOL_NAME || event.isError) return;
+	async function refreshOverlay(): Promise<void> {
+		const generation = lifecycleGeneration;
 		try {
-			await updateTodoOverlay();
+			await updateTodoOverlay(false, generation);
+			if (generation === lifecycleGeneration) overlayRefreshPending = false;
 		} catch (e) {
-			// The tool itself succeeded — a transient overlay-load failure only
-			// costs this one refresh, and the loader's cleared memo lets the next
-			// update retry. Don't surface that as an extension error. The latched
+			// The tool itself succeeded — a transient overlay refresh failure
+			// is retried at a turn/settlement boundary, even if this was the final
+			// todo call. Don't surface that as an extension error. The latched
 			// stale-namespace error still propagates: it never self-heals, and the
 			// user needs its restart guidance.
+			if (generation !== lifecycleGeneration) return;
 			if (isStaleOverlayModuleError(e)) throw e;
-			console.warn(`[rpiv-todo] overlay refresh failed (will retry on next update): ${formatError(e)}`);
+			overlayRefreshPending = true;
+			console.warn(`[rpiv-todo] overlay refresh failed (will retry at next boundary): ${formatError(e)}`);
 		}
+	}
+
+	pi.on("tool_execution_end", async (event) => {
+		if (event.toolName !== TOOL_NAME || event.isError) return;
+		await refreshOverlay();
 	});
+
+	// A failed final completion refresh must not depend on another todo call.
+	// Retry only dirty UI work, once per host boundary, without model continuations
+	// or branch replay (the committed live store is already authoritative).
+	const retryPendingRefresh = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+		if (!overlayRefreshPending || !uiCtx) return;
+		try {
+			if (sid(ctx) !== getActiveRenderSession()) return;
+		} catch (e) {
+			if (!isStaleCtxError(e)) throw e;
+			return;
+		}
+		await refreshOverlay();
+	};
+	pi.on("turn_end", retryPendingRefresh);
+	pi.on("agent_settled", retryPendingRefresh);
 
 	// Evaluate the lazy graph after startup while Pi's boot-time dependency paths
 	// are still stable. This loads no widget and constructs no overlay; those stay
